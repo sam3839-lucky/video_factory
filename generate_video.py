@@ -8,7 +8,6 @@ import sys, os, subprocess, re
 
 os.environ["IMAGEMAGICK_BINARY"] = "/opt/homebrew/bin/magick"
 
-ROOT_DIR = "/Users/sam/MoneyPrinterV2"
 MP_DIR = os.path.expanduser("~/Videos")
 os.makedirs(MP_DIR, exist_ok=True)
 
@@ -41,31 +40,52 @@ def fmt_time(seconds):
 
 
 def _parse_cn_str(s):
-    """解析纯中文数字字符串，返回整数值"""
+    """递归解析纯中文数字字符串，正确处理连续量词如"三百二十万"。
+    算法：找右侧最大量词（亿>万>千>百>十），左侧递归值 × 右侧量词值。
+    """
     if not s:
         return 0
     cn_digit = {'零':0,'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'〇':0}
-    cn_unit = {'億':100000000,'亿':100000000,'萬':10000,'万':10000,
-               '千':1000,'仟':1000,'百':100,'佰':100,'十':10,'拾':10}
-    result = 0
-    prev = 0
-    i, n = 0, len(s)
-    while i < n:
-        ch = s[i]
-        if ch in cn_digit:
-            prev = prev * 10 + cn_digit[ch]
-            i += 1
-        elif ch in cn_unit:
-            v = cn_unit[ch]
-            if prev > 0:
-                result += prev * v
-                prev = 0
-            else:
-                result += v
-            i += 1
-        else:
-            i += 1
-    return result + prev
+    cn_unit_rank = {'十':1, '拾':1, '百':2, '佰':2, '千':3, '仟':3, '万':4, '萬':4, '亿':5, '億':5}
+
+    def find_max_unit(s):
+        """找字符串右侧最大量词的位置和值，返回 (index, rank, value)"""
+        best_idx, best_rank, best_val = -1, -1, 1
+        for i, ch in enumerate(s):
+            if ch in cn_unit_rank and cn_unit_rank[ch] > best_rank:
+                # 取值（统一用简体万进位）
+                val = {'十':10,'拾':10,'百':100,'佰':100,'千':1000,'仟':1000,'万':10000,'萬':10000,'亿':100000000,'億':100000000}[ch]
+                best_idx, best_rank, best_val = i, cn_unit_rank[ch], val
+        return best_idx, best_val
+
+    idx, unit_val = find_max_unit(s)
+
+    # 十万、一万这种裸"十/万"在中文里等同于"十单位/万单位"
+    if idx == -1:
+        val = 0
+        has_digit = False
+        for ch in s:
+            if ch in cn_digit:
+                val = val * 10 + cn_digit[ch]
+                has_digit = True
+            # 忽略零
+        return val
+
+    # 裸单位（如"十"单独出现）：没有左侧数字时，十=10，百=100
+    if not left and unit_val >= 10:
+        right_val = _parse_cn_str(right) if right else 0
+        return unit_val + right_val
+
+    left = s[:idx]
+    right = s[idx+1:]
+
+    # 右侧递归（处理"一万亿"的"亿"）
+    right_val = _parse_cn_str(right) if right else 0
+    # 左侧递归（处理"三百二十万"的"万"前面的部分）
+    left_val = _parse_cn_str(left) if left else 0
+
+    # 组合：左边值（如果有单位则已乘过，否则是裸数字）× 右边量词 + 右边递归值
+    return left_val * unit_val + right_val
 
 
 def cn_to_arabic(text):
@@ -195,20 +215,29 @@ def build_subtitle_segments(segments, audio_duration):
 
 
 def make_bg_with_avatar():
+    """用 make_bg.py 生成的深圳背景图，在上面叠加数字人窗口"""
     from PIL import Image, ImageDraw
-    bg_path = os.path.join(MP_DIR, "bg_with_avatar.png")
-    bg = Image.new('RGB', (WIDTH, HEIGHT), '#1a1a2e')
-    draw = ImageDraw.Draw(bg)
-    for y in range(0, 300, 80):
-        draw.rectangle([0, y, WIDTH, y+40], fill='#16213e')
-    # 数字人窗口占位
-    dv = Image.new('RGB', (DV_W, DV_H), '#6a0dad')
+    # 优先用 make_bg.py 生成的深圳天际线背景
+    src_bg = os.path.join(os.path.dirname(__file__), "bg_shenzhen.png")
+    avatar_bg = os.path.join(MP_DIR, "bg_with_avatar.png")
+
+    if os.path.exists(src_bg):
+        bg = Image.open(src_bg).convert("RGB")
+    else:
+        # fallback：纯色背景
+        bg = Image.new('RGB', (WIDTH, HEIGHT), '#1a1a2e')
+        draw = ImageDraw.Draw(bg)
+        for y in range(0, 300, 80):
+            draw.rectangle([0, y, WIDTH, y+40], fill='#16213e')
+
+    # 数字人窗口占位（半透明紫色块）
+    dv = Image.new('RGBA', (DV_W, DV_H), (106, 13, 173, 180))
     dv_draw = ImageDraw.Draw(dv)
     dv_draw.rectangle([0, 0, DV_W-1, DV_H-1], outline='#ffffff', width=4)
     dv_draw.text((DV_W//2 - 150, DV_H//2 - 20), "数字人视频区域", fill='white')
-    bg.paste(dv, (DV_X, DV_Y))
-    bg.save(bg_path)
-    return bg_path
+    bg.paste(dv, (DV_X, DV_Y), dv)
+    bg.save(avatar_bg)
+    return avatar_bg
 
 
 def composite_video(bg_path, output_path, duration):
