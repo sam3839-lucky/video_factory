@@ -8,3 +8,5 @@ venv/
 *.wav
 *.aiff
 *.aac
+*cookies*.json
+*_state.json
