@@ -17,8 +17,22 @@ import shutil
 from pathlib import Path
 
 # ========== 配置 ==========
-BASE_TOKEN = "XX8abIKw7a9GwBsVt57crlbHnOe"
-TABLE_ID = "tblHptO4dDJckuFF"
+# 飞书配置：从环境变量或配置文件读取（不要硬编码到代码里）
+def _load_feishu_config():
+    base_token = os.environ.get("FEISHU_BASE_TOKEN", "")
+    table_id = os.environ.get("FEISHU_TABLE_ID", "tblHptO4dDJckuFF")
+    # 配置文件放在 ~/Library/Application Support/video_factory/config.json
+    config_path = Path.home() / "Library/Application Support/video_factory/config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+            base_token = base_token or cfg.get("FEISHU_BASE_TOKEN", "")
+            table_id = cfg.get("FEISHU_TABLE_ID", table_id)
+    if not base_token:
+        raise RuntimeError("请设置环境变量 FEISHU_BASE_TOKEN 或 ~/Library/Application Support/video_factory/config.json")
+    return base_token, table_id
+
+BASE_TOKEN, TABLE_ID = _load_feishu_config()
 FEISHU_CHAT_ID = "oc_e8b467f584d247feb1f6bf63bbe33d66"  # 团队工作报告群
 MP_DIR = Path.expanduser(Path("~/Videos")).resolve()
 DRAFTS_DIR = MP_DIR / "drafts"
@@ -477,15 +491,11 @@ def unpublish_from_video_account(record: dict) -> bool:
     
     print(f"  下架视频: {video_title}")
     print(f"  视频链接: {video_url}")
-    
-    # TODO: 浏览器自动化下架
-    # 1. 登录视频号后台
-    # 2. 进入内容管理
-    # 3. 找到对应视频
-    # 4. 点击下架/删除
-    # 5. 确认下架
-    
-    raise NotImplementedError("视频号下架自动化尚未实现")
+
+    # 视频号下架自动化尚未实现，登录视频号后台手动下架
+    # 后续可基于 publish_to_video_account.py 的 Playwright 自动化扩展
+    print("  ⚠️ 视频号下架自动化尚未实现，请在视频号后台手动下架")
+    return False
 
 
 # ========== 公网预览链接 ==========
@@ -764,14 +774,14 @@ def process_unpublishing():
             update_record(rid, {
                 "发布状态": "failed",
                 "错误信息": str(e)
-            })
+                })
+
         except Exception as e:
             print(f"  ❌ 错误: {e}")
             update_record(rid, {
                 "发布状态": "failed",
                 "错误信息": str(e)
             })
-
 
 def main():
     print(f"[{datetime.datetime.now().isoformat()}] 视频自动发布 Cron 启动")

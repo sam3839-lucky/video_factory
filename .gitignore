@@ -10,3 +10,4 @@ venv/
 *.aac
 *cookies*.json
 *_state.json
+video_account_state.json
