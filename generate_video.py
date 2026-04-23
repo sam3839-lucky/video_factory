@@ -11,13 +11,28 @@ os.environ["IMAGEMAGICK_BINARY"] = "/opt/homebrew/bin/magick"
 MP_DIR = os.path.expanduser("~/Videos")
 os.makedirs(MP_DIR, exist_ok=True)
 
-SCRIPT = (
+import argparse
+
+parser = argparse.ArgumentParser(description="深圳楼市成交日报视频生成")
+parser.add_argument("script", nargs="?", default=None, help="视频文案文本")
+parser.add_argument("--output", "-o", default=None, help="输出视频路径")
+args = parser.parse_args()
+
+# 如果命令行没传，使用环境变量或默认文案
+DEFAULT_SCRIPT = (
     "深圳楼市成交数据来了！4月21日新房认购网签90套，"
     "现房购房合同网签71套；二手房成交374套，一手新房与二手房一共成交535套。"
     "4月累计成交7731套，环比上涨54.65%。自4月以来，一手房新批准预售0套，"
     "想买到称心如意的房子，一定要学会看数据，知行情。"
     "关注我，感知深圳楼市温度！"
 )
+
+if args.script:
+    SCRIPT = args.script
+elif os.environ.get("VIDEO_SCRIPT"):
+    SCRIPT = os.environ["VIDEO_SCRIPT"]
+else:
+    SCRIPT = DEFAULT_SCRIPT
 
 WIDTH, HEIGHT = 1080, 1920
 FPS = 30
@@ -367,7 +382,8 @@ def main():
     add_audio(raw_video, wav_path, audio_video)
 
     print("[5/5] 叠加字幕...")
-    final = os.path.join(MP_DIR, "shenzhen_realestate.mp4")
+    # 输出路径：命令行指定 > 环境变量 > 默认
+    final = args.output or os.environ.get("VIDEO_OUTPUT") or os.path.join(MP_DIR, "shenzhen_realestate.mp4")
     overlay_subtitles_simple(audio_video, subs, final)
     print(f"\n完成: {final}")
 
