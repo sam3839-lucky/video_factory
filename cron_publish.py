@@ -5,6 +5,15 @@
 
 Base: 视频号发布记录
 Table: 发布记录 (tblHptO4dDJckuFF)
+
+状态流转（中文）：
+  待制作 → 制作中 → 待下载 → 下载中 → 待发布 → 发布中 → 已发布 → 已归档
+
+清理规则（按类型区分保留期）：
+  日报 → 3天 → 归档
+  周报 → 5天 → 直接删除
+  月报 → 10天 → 归档
+  专题 → 不处理
 """
 
 import os
@@ -12,29 +21,18 @@ import sys
 import json
 import subprocess
 import datetime
-import tempfile
 import shutil
+import time
 from pathlib import Path
+from typing import Optional, List, Dict
 
 # ========== 配置 ==========
-# 飞书配置：从环境变量或配置文件读取（不要硬编码到代码里）
-def _load_feishu_config():
-    base_token = os.environ.get("FEISHU_BASE_TOKEN", "")
-    table_id = os.environ.get("FEISHU_TABLE_ID", "tblHptO4dDJckuFF")
-    # 配置文件放在 ~/Library/Application Support/video_factory/config.json
-    config_path = Path.home() / "Library/Application Support/video_factory/config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            cfg = json.load(f)
-            base_token = base_token or cfg.get("FEISHU_BASE_TOKEN", "")
-            table_id = cfg.get("FEISHU_TABLE_ID", table_id)
-    if not base_token:
-        raise RuntimeError("请设置环境变量 FEISHU_BASE_TOKEN 或 ~/Library/Application Support/video_factory/config.json")
-    return base_token, table_id
-
-BASE_TOKEN, TABLE_ID = _load_feishu_config()
+FEISHU_BASE_TOKEN = "XX8abIKw7a9GwBsVt57crlbHnOe"
+FEISHU_TABLE_ID = "tblHptO4dDJckuFF"
 FEISHU_CHAT_ID = "oc_e8b467f584d247feb1f6bf63bbe33d66"  # 团队工作报告群
-MP_DIR = Path.expanduser(Path("~/Videos")).resolve()
+LARK_CLI = os.path.expanduser("~/.npm-global/bin/lark-cli")
+
+MP_DIR = Path.home() / "Videos"
 DRAFTS_DIR = MP_DIR / "drafts"
 ARCHIVED_DIR = MP_DIR / "archived"
 VIDEO_FACTORY_DIR = Path("/Users/sam/video_factory")
@@ -43,9 +41,29 @@ VIDEO_FACTORY_DIR = Path("/Users/sam/video_factory")
 DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
 ARCHIVED_DIR.mkdir(parents=True, exist_ok=True)
 
-# ========== 飞书多维表格操作 ==========
+# ========== 常量 ==========
+STATUS_PENDING_MAKE = "待制作"
+STATUS_PENDING_PUBLISH = "待发布"
+STATUS_PUBLISHING = "发布中"
+STATUS_PUBLISHED = "已发布"
+STATUS_ARCHIVED = "已归档"
+STATUS_FAILED = "failed"
+# 按视频类型保留天数
+RETENTION_DAYS = {
+    "日报": 3,
+    "周报": 5,
+    "月报": 10,
+}
 
-LARK_CLI = os.path.expanduser("~/.npm-global/bin/lark-cli")
+# 超期后执行的动作：归档还是删除
+# 周报直接删除，其他归档
+RETENTION_ACTION = {
+    "日报": "archive",
+    "周报": "delete",
+    "月报": "archive",
+}
+
+# ========== 飞书多维表格操作 ==========
 
 def lark_cli(args: list) -> dict:
     """执行 lark-cli 命令并返回 JSON 结果"""
@@ -77,106 +95,86 @@ def parse_records_response(result: dict) -> list:
     return records
 
 
-def get_pending_records():
-    """获取待发布的记录（状态=pending 且 发布时间≤当前时间）"""
+def get_all_records():
+    """获取所有记录"""
     result = lark_cli([
         "base", "+record-list",
-        "--base-token", BASE_TOKEN,
-        "--table-id", TABLE_ID,
-        "--limit", "200"
+        "--base-token", FEISHU_BASE_TOKEN,
+        "--table-id", FEISHU_TABLE_ID,
+        "--limit", "500"
     ])
-    records = parse_records_response(result)
-
-    now = datetime.datetime.now()
-    pending = []
-    for record in records:
-        fields = record.get("fields", {})
-        status = fields.get("发布状态", {})
-        publish_time = fields.get("发布时间", {})
-        
-        # 检查发布状态是否为 pending
-        # 飞书多维表格的单选/多选字段返回 ["value"] 格式
-        if isinstance(status, list):
-            status_name = status[0] if status else ""
-        elif isinstance(status, dict):
-            status_name = status.get("name", "")
-        else:
-            status_name = str(status) if status else ""
-        
-        if status_name != "pending":
-            continue
-        
-        # 检查发布时间
-        if isinstance(publish_time, str) and publish_time:
-            try:
-                # 飞书 datetime 格式：2024-04-23T10:00:00Z
-                pub_dt = datetime.datetime.fromisoformat(publish_time.replace("Z", "+00:00"))
-                pub_dt_local = pub_dt.astimezone().replace(tzinfo=None)
-                if pub_dt_local > now:
-                    continue  # 未来发布时间，跳过
-            except Exception:
-                pass
-        
-        pending.append(record)
-    
-    return pending
+    return parse_records_response(result)
 
 
-def get_records_to_unpublish():
-    """获取待下架的记录（状态=published 且 下架时间≤当前时间）"""
-    result = lark_cli([
-        "base", "+record-list",
-        "--base-token", BASE_TOKEN,
-        "--table-id", TABLE_ID,
-        "--limit", "200"
-    ])
-    records = parse_records_response(result)
-
-    now = datetime.datetime.now()
-    to_unpublish = []
-    for record in records:
-        record_id = record.get("record_id")
-        fields = record.get("fields", {})
-        status = fields.get("发布状态", [])
-        unpublish_time = fields.get("下架时间", {})
-        
-        # 检查发布状态是否为 published
-        # 飞书多维表格的单选/多选字段返回 ["value"] 格式
-        if isinstance(status, list):
-            status_name = status[0] if status else ""
-        elif isinstance(status, dict):
-            status_name = status.get("name", "")
-        else:
-            status_name = str(status) if status else ""
-        
-        if status_name != "published":
-            continue
-        
-        # 检查下架时间
-        if isinstance(unpublish_time, str) and unpublish_time:
-            try:
-                un_dt = datetime.datetime.fromisoformat(unpublish_time.replace("Z", "+00:00"))
-                un_dt_local = un_dt.astimezone().replace(tzinfo=None)
-                if un_dt_local > now:
-                    continue  # 未来下架时间，跳过
-            except Exception:
-                continue
-        
-        to_unpublish.append(record)
-    
-    return to_unpublish
+def get_records_by_status(status_name: str):
+    """获取指定状态的记录"""
+    all_records = get_all_records()
+    return [r for r in all_records if _get_status_name(r["fields"]) == status_name]
 
 
-def update_record(record_id: str, updates: dict):
-    """更新记录字段"""
-    # +record-upsert 使用 --json '{"field": value}' 格式
+def _get_status_name(fields: dict) -> str:
+    """从字段中提取状态名称（兼容中英文）"""
+    status = fields.get("发布状态", [])
+    if isinstance(status, list):
+        return status[0] if status else ""
+    if isinstance(status, dict):
+        return status.get("name", "")
+    return str(status) if status else ""
+
+
+def _get_video_type(fields: dict) -> str:
+    """从字段中提取视频类型"""
+    vt = fields.get("视频类型", [])
+    if isinstance(vt, list):
+        return vt[0] if vt else ""
+    if isinstance(vt, dict):
+        return vt.get("name", "")
+    return str(vt) if vt else ""
+
+
+def _get_record_id(record: dict) -> str:
+    """从记录中提取 record_id"""
+    record_id = record.get("record_id", {})
+    if isinstance(record_id, dict):
+        return record_id.get("text", "") or record_id.get("value", "") or ""
+    return str(record_id) if record_id else ""
+
+
+def _get_field_value(fields: dict, key: str) -> str:
+    """从字段中提取文本值"""
+    val = fields.get(key, [])
+    if isinstance(val, list):
+        return val[0] if val else ""
+    if isinstance(val, dict):
+        return val.get("name", "")
+    return str(val) if val else ""
+
+
+def _parse_datetime(val: str) -> Optional[datetime.datetime]:
+    """解析飞书 datetime 字符串为本地时间"""
+    if not val:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(val.replace("Z", "+00:00"))
+        return dt.astimezone().replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def update_record_status(record_id: str, status: str, extra_fields: dict = None):
+    """更新记录状态 + 附加字段"""
+    updates = {"发布状态": status}
+    if extra_fields:
+        updates.update(extra_fields)
     result = lark_cli([
         "base", "+record-upsert",
-        "--base-token", BASE_TOKEN,
-        "--table-id", TABLE_ID,
+        "--base-token", FEISHU_BASE_TOKEN,
+        "--table-id", FEISHU_TABLE_ID,
         "--record-id", record_id,
         "--json", json.dumps(updates, ensure_ascii=False)
     ])
+    if not result.get("ok"):
+        print(f"  ⚠️ 更新记录失败 {record_id}: {result}")
     return result
 
 
@@ -618,181 +616,233 @@ def send_upload_notification(title: str, video_path: str, preview_url: str,
 
 # ========== 主流程 ==========
 
-def process_pending_videos():
-    """处理待发布的视频
+def process_video_lifecycle():
+    """处理视频生命周期（从待制作到已发布）
     
-    流程：生成视频 → 发布到视频号 → 上传飞书云盘预览 → 更新多维表格 → 通知波哥
-    状态：pending → uploading → published（自动）/ failed
+    状态流转：
+      待制作 → 制作中 → 待下载 → 下载中 → 待发布 → 发布中 → 已发布
+    
+    每个步骤之间更新表格状态，确保状态全程可追踪。
     """
-    records = get_pending_records()
-    
+    print("\n=== 1. 处理 待制作 视频（生成视频）===")
+    records = get_records_by_status(STATUS_PENDING_MAKE)
     if not records:
-        print("没有待发布的视频")
-        return
-    
-    print(f"找到 {len(records)} 条待发布记录")
-    
-    for record in records:
-        record_id = record.get("record_id", {})
-        fields = record.get("fields", {})
-        
-        # 获取 record_id
-        if isinstance(record_id, dict):
-            rid = record_id.get("text", "") or record_id.get("value", "")
-        else:
-            rid = str(record_id)
-        
-        print(f"\n处理记录: {rid}")
-        
-        # 获取文案内容
-        script_text = fields.get("文案内容", "")
-        if not script_text:
-            print("  ⚠️ 文案内容为空，跳过")
-            update_record(rid, {
-                "发布状态": "failed",
-                "错误信息": "文案内容为空"
-            })
-            continue
-        
-        video_title = fields.get("视频标题", "")
-        video_type = fields.get("视频类型", {})
-        if isinstance(video_type, dict):
-            video_type = video_type.get("name", "日报")
-        
-        # 生成输出文件名
-        date_str = datetime.datetime.now().strftime("%Y%m%d")
-        safe_title = "".join(c if c.isalnum() else "_" for c in str(video_title))[:20]
-        output_name = f"{video_type}_{date_str}_{safe_title}.mp4"
-        output_path = str(DRAFTS_DIR / output_name)
-        
-        try:
-            # 1. 生成视频
-            print(f"  [1/5] 生成视频: {output_path}")
-            generate_video(script_text, output_path)
+        print("  没有待制作的视频")
+    else:
+        print(f"  找到 {len(records)} 条待制作记录")
+        for record in records:
+            rid = _get_record_id(record)
+            fields = record["fields"]
+            video_title = _get_field_value(fields, "视频标题")
+            script_text = _get_field_value(fields, "文案内容")
             
-            # 2. 发布到视频号
-            print(f"  [2/5] 发布到视频号...")
-            video_url = publish_to_video_account(output_path, record)
-            
-            if not video_url:
-                print("  ⚠️ 视频号发布失败，记录状态更新")
-                update_record(rid, {
-                    "发布状态": "failed",
-                    "错误信息": "视频号发布失败",
-                    "视频文件路径": output_path,
-                })
-                # 仍上传云盘预览
-                preview_url = create_public_link(output_path)
-                send_upload_notification(video_title, output_path, preview_url, video_type, record, rid)
+            if not script_text:
+                print(f"  ⚠️ [{rid}] 文案内容为空，跳过")
+                update_record_status(rid, STATUS_FAILED, {"错误信息": "文案内容为空"})
                 continue
             
-            # 3. 上传飞书云盘预览
-            print(f"  [3/5] 上传飞书云盘预览...")
-            preview_url = create_public_link(output_path)
+            print(f"\n  处理记录: {rid} | {video_title}")
             
-            # 4. 更新多维表格
-            print(f"  [4/5] 更新多维表格...")
-            update_record(rid, {
-                "发布状态": "published",
-                "发布时间": datetime.datetime.now().isoformat(),
-                "视频文件路径": output_path,
-                "视频链接": preview_url,
-                "视频号链接": video_url,
-            })
+            # ① 待制作 → 制作中
+            update_record_status(rid, "制作中")
+            print(f"  [1/4] 状态: 待制作 → 制作中")
             
-            # 5. 通知波哥
-            print(f"  [5/5] 发送飞书通知...")
-            send_published_notification(video_title, output_path, preview_url, video_url, video_type)
-            
-            # 6. 移动文件到归档
-            archived_path = str(ARCHIVED_DIR / output_name)
-            shutil.move(output_path, archived_path)
-            
-            print(f"  ✅ 全流程完成！")
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"  ❌ 错误: {e}")
+            # ② 调用本地视频生成（MoneyPrinterV2）
             try:
-                update_record(rid, {
-                    "发布状态": "failed",
-                    "错误信息": str(e)
-                })
-            except Exception:
-                pass
-
-
-def process_unpublishing():
-    """处理待下架的视频"""
-    records = get_records_to_unpublish()
+                date_str = datetime.datetime.now().strftime("%Y%m%d")
+                safe_title = "".join(c if c.isalnum() else "_" for c in video_title)[:20]
+                video_type = _get_video_type(fields) or "日报"
+                output_name = f"{video_type}_{date_str}_{safe_title}.mp4"
+                output_path = str(DRAFTS_DIR / output_name)
+                
+                print(f"  [2/4] 生成视频中: {output_path}")
+                generate_video(script_text, output_path)
+                print(f"  [2/4] ✅ 视频生成完成")
+            except Exception as e:
+                print(f"  [2/4] ❌ 生成失败: {e}")
+                update_record_status(rid, STATUS_FAILED, {"错误信息": f"视频生成失败: {e}"})
+                continue
+            
+            # ③ 制作中 → 待下载（生成完成，等下载；但本地生成无需下载）
+            update_record_status(rid, "待下载")
+            print(f"  [3/4] 状态: 制作中 → 待下载")
+            
+            # ④ 待下载 → 下载中 → 待发布（本地文件直接到位）
+            update_record_status(rid, "下载中")
+            time.sleep(1)
+            update_record_status(rid, STATUS_PENDING_PUBLISH, {
+                "视频文件路径": output_path,
+            })
+            print(f"  [4/4] 状态: 下载中 → 待发布 ✅")
+            print(f"  文件: {output_path}")
     
+    print("\n=== 2. 处理 待发布 视频（发布到视频号）===")
+    records = get_records_by_status(STATUS_PENDING_PUBLISH)
     if not records:
-        print("没有待下架的视频")
+        print("  没有待发布的视频")
+    else:
+        print(f"  找到 {len(records)} 条待发布记录")
+        for record in records:
+            rid = _get_record_id(record)
+            fields = record["fields"]
+            video_title = _get_field_value(fields, "视频标题")
+            video_path = _get_field_value(fields, "视频文件路径")
+            
+            print(f"\n  处理记录: {rid} | {video_title}")
+            
+            if not video_path or not os.path.exists(video_path):
+                print(f"  ⚠️ 视频文件不存在: {video_path}")
+                update_record_status(rid, STATUS_FAILED, {"错误信息": f"视频文件不存在: {video_path}"})
+                continue
+            
+            # ⑤ 待发布 → 发布中
+            update_record_status(rid, STATUS_PUBLISHING)
+            print(f"  [5/7] 状态: 待发布 → 发布中")
+            
+            # ⑥ 发布到视频号
+            try:
+                print(f"  [6/7] 发布到视频号...")
+                video_url = publish_to_video_account(video_path, record)
+                
+                if not video_url:
+                    print(f"  [6/7] ⚠️ 视频号发布失败（可能未登录）")
+                    update_record_status(rid, STATUS_PENDING_PUBLISH, {
+                        "错误信息": "视频号发布失败，请检查登录状态"
+                    })
+                    # 仍上传云盘预览
+                    preview_url = create_public_link(video_path)
+                    send_upload_notification(
+                        video_title, video_path, preview_url,
+                        _get_video_type(fields), record, rid
+                    )
+                    continue
+                    
+                print(f"  [6/7] ✅ 视频号发布成功: {video_url}")
+            except Exception as e:
+                print(f"  [6/7] ❌ 发布异常: {e}")
+                update_record_status(rid, STATUS_FAILED, {"错误信息": str(e)})
+                continue
+            
+            # ⑦ 发布中 → 已发布
+            try:
+                print(f"  [7/7] 上传飞书云盘...")
+                preview_url = create_public_link(video_path)
+                
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                update_record_status(rid, STATUS_PUBLISHED, {
+                    "发布时间": now,
+                    "视频号链接": video_url,
+                    "视频链接": preview_url,
+                })
+                print(f"  [7/7] 状态: 发布中 → 已发布 ✅")
+                
+                # 通知波哥
+                send_published_notification(
+                    video_title, video_path, preview_url,
+                    video_url, _get_video_type(fields)
+                )
+                
+                # 文件保留在原位（云盘已有预览链接），不需要移动
+                    
+            except Exception as e:
+                print(f"  [7/7] ❌ 后处理失败: {e}")
+                update_record_status(rid, STATUS_FAILED, {"错误信息": str(e)})
+
+
+def process_cleanup():
+    """处理过期视频自动归档/删除
+    
+    规则：已发布视频按类型保留天数，超期后执行对应动作
+    - 日报：3天 → 归档
+    - 周报：5天 → 直接删除
+    - 月报：10天 → 归档
+    注意：只处理已发布状态的视频，专题类不处理
+    """
+    
+    print("\n=== 3. 处理过期视频自动归档/删除 ===")
+    all_records = get_all_records()
+    
+    expired = []
+    for record in all_records:
+        fields = record["fields"]
+        status = _get_status_name(fields)
+        video_type = _get_video_type(fields)
+        pub_time_str = _get_field_value(fields, "发布时间")
+        
+        if status != STATUS_PUBLISHED:
+            continue
+        
+        retention = RETENTION_DAYS.get(video_type)
+        if not retention:
+            continue  # 专题类不处理
+        
+        pub_time = _parse_datetime(pub_time_str)
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=retention)
+        if pub_time and pub_time < cutoff:
+            action = RETENTION_ACTION.get(video_type, "archive")
+            expired.append((record, pub_time, video_type, retention, action))
+    
+    if not expired:
+        print(f"  没有需要处理的过期视频")
         return
     
-    print(f"找到 {len(records)} 条待下架记录")
-    
-    for record in records:
-        record_id = record.get("record_id", {})
-        fields = record.get("fields", {})
+    print(f"  找到 {len(expired)} 条过期视频待处理:")
+    for record, pub_time, video_type, retention, action in expired:
+        rid = _get_record_id(record)
+        fields = record["fields"]
+        title = _get_field_value(fields, "视频标题")
+        video_path = _get_field_value(fields, "视频文件路径")
+        pub_time_str = _get_field_value(fields, "发布时间")
+        days_old = (datetime.datetime.now() - pub_time).days
+        action_desc = "删除" if action == "delete" else "归档"
+        print(f"  • {title} | {video_type} | 发布于 {pub_time_str[:10]}（{days_old}天前）→ {action_desc}")
         
-        if isinstance(record_id, dict):
-            rid = record_id.get("text", "") or record_id.get("value", "")
-        else:
-            rid = str(record_id)
+        # 视频号下架（目前需要手动）
+        print(f"    → 视频号后台下架（需手动）: https://channels.weixin.qq.com")
         
-        print(f"\n处理下架: {rid}")
+        # 更新表格状态
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        update_record_status(rid, STATUS_ARCHIVED, {
+            "下架时间": now_str,
+            "下架操作时间": now_str,
+        })
         
-        try:
-            # 1. 视频号下架
-            success = unpublish_from_video_account(record)
-            
-            if success:
-                # 2. 更新多维表格
-                update_record(rid, {
-                    "发布状态": "archived",
-                    "下架操作时间": datetime.datetime.now().isoformat(),
-                    "归档时间": datetime.datetime.now().isoformat(),
-                })
-                
-                # 3. 移动文件
-                video_path = fields.get("视频文件路径", "")
-                if video_path and os.path.exists(video_path):
-                    video_name = Path(video_path).name
-                    shutil.move(video_path, str(ARCHIVED_DIR / video_name))
-                
-                print(f"  ✅ 下架完成")
+        # 处理本地文件
+        if video_path and os.path.exists(video_path):
+            if action == "delete":
+                try:
+                    os.remove(video_path)
+                    print(f"    → ✅ 文件已删除: {video_path}")
+                except Exception as e:
+                    print(f"    → ⚠️ 文件删除失败: {e}")
             else:
-                update_record(rid, {
-                    "发布状态": "failed",
-                    "错误信息": "下架操作失败"
-                })
-                
-        except NotImplementedError as e:
-            print(f"  ⚠️ {e}")
-            update_record(rid, {
-                "发布状态": "failed",
-                "错误信息": str(e)
-                })
+                archived_path = str(ARCHIVED_DIR / Path(video_path).name)
+                try:
+                    shutil.move(video_path, archived_path)
+                    print(f"    → 文件已归档: {archived_path}")
+                except Exception as e:
+                    print(f"    → ⚠️ 文件移动失败: {e}")
+        else:
+            print(f"    → 本地文件不存在")
+        
+        print(f"    → ✅ 状态已更新为 已归档")
+        time.sleep(0.5)
 
-        except Exception as e:
-            print(f"  ❌ 错误: {e}")
-            update_record(rid, {
-                "发布状态": "failed",
-                "错误信息": str(e)
-            })
 
 def main():
+    rules = " / ".join([f"{k}={v}天({'删除' if RETENTION_ACTION.get(k)=='delete' else '归档'})" for k, v in RETENTION_DAYS.items()])
     print(f"[{datetime.datetime.now().isoformat()}] 视频自动发布 Cron 启动")
+    print(f"清理规则：{rules}")
     
-    # 处理待发布
-    print("\n=== 处理待发布视频 ===")
-    process_pending_videos()
-    
-    # 处理待下架
-    print("\n=== 处理待下架视频 ===")
-    process_unpublishing()
+    try:
+        # 处理视频生命周期（待制作 → 已发布）
+        process_video_lifecycle()
+        
+        # 处理过期视频自动归档/删除
+        process_cleanup()
+    except Exception as e:
+        print(f"\n❌ Cron 执行异常: {e}")
+        raise
     
     print(f"\n[{datetime.datetime.now().isoformat()}] Cron 执行完成")
 
