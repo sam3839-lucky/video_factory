@@ -23,8 +23,9 @@ import subprocess
 import datetime
 import shutil
 import time
+import fcntl
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional
 
 # ========== 配置 ==========
 # 飞书配置：从环境变量或配置文件读取（不要硬编码到代码里）
@@ -79,6 +80,9 @@ RETENTION_ACTION = {
     "周报": "delete",
     "月报": "archive",
 }
+
+# 并发锁文件，防止多个 cron 实例同时处理同一记录
+LOCK_FILE = Path.home() / ".video_factory/cron.lock"
 
 # ========== 飞书多维表格操作 ==========
 
@@ -850,17 +854,29 @@ def main():
     rules = " / ".join([f"{k}={v}天({'删除' if RETENTION_ACTION.get(k)=='delete' else '归档'})" for k, v in RETENTION_DAYS.items()])
     print(f"[{datetime.datetime.now().isoformat()}] 视频自动发布 Cron 启动")
     print(f"清理规则：{rules}")
-    
+
+    # 文件锁，防止并发重复处理
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("⚠️ 另一个 cron 实例正在运行，退出")
+        return
+
     try:
         # 处理视频生命周期（待制作 → 已发布）
         process_video_lifecycle()
-        
+
         # 处理过期视频自动归档/删除
         process_cleanup()
     except Exception as e:
         print(f"\n❌ Cron 执行异常: {e}")
         raise
-    
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
     print(f"\n[{datetime.datetime.now().isoformat()}] Cron 执行完成")
 
 
