@@ -862,6 +862,7 @@ def main():
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print("⚠️ 另一个 cron 实例正在运行，退出")
+        lock_fd.close()
         return
 
     try:
