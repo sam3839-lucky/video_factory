@@ -27,8 +27,22 @@ from pathlib import Path
 from typing import Optional, List, Dict
 
 # ========== 配置 ==========
-FEISHU_BASE_TOKEN = "XX8abIKw7a9GwBsVt57crlbHnOe"
-FEISHU_TABLE_ID = "tblHptO4dDJckuFF"
+# 飞书配置：从环境变量或配置文件读取（不要硬编码到代码里）
+def _load_feishu_config():
+    base_token = os.environ.get("FEISHU_BASE_TOKEN", "")
+    table_id = os.environ.get("FEISHU_TABLE_ID", "tblHptO4dDJckuFF")
+    # 配置文件放在 ~/Library/Application Support/video_factory/config.json
+    config_path = Path.home() / "Library/Application Support/video_factory/config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+            base_token = base_token or cfg.get("FEISHU_BASE_TOKEN", "")
+            table_id = cfg.get("FEISHU_TABLE_ID", table_id)
+    if not base_token:
+        raise RuntimeError("请设置环境变量 FEISHU_BASE_TOKEN 或 ~/Library/Application Support/video_factory/config.json")
+    return base_token, table_id
+
+FEISHU_BASE_TOKEN, FEISHU_TABLE_ID = _load_feishu_config()
 FEISHU_CHAT_ID = "oc_e8b467f584d247feb1f6bf63bbe33d66"  # 团队工作报告群
 LARK_CLI = os.path.expanduser("~/.npm-global/bin/lark-cli")
 
@@ -47,7 +61,10 @@ STATUS_PENDING_PUBLISH = "待发布"
 STATUS_PUBLISHING = "发布中"
 STATUS_PUBLISHED = "已发布"
 STATUS_ARCHIVED = "已归档"
-STATUS_FAILED = "failed"
+# 失败状态（细分到具体环节）
+STATUS_FAILED_MAKE = "生成失败"
+STATUS_FAILED_PUBLISH = "发布失败"
+STATUS_FAILED_UPLOAD = "上传失败"
 # 按视频类型保留天数
 RETENTION_DAYS = {
     "日报": 3,
@@ -638,7 +655,7 @@ def process_video_lifecycle():
             
             if not script_text:
                 print(f"  ⚠️ [{rid}] 文案内容为空，跳过")
-                update_record_status(rid, STATUS_FAILED, {"错误信息": "文案内容为空"})
+                update_record_status(rid, STATUS_FAILED_MAKE, {"错误信息": "文案内容为空"})
                 continue
             
             print(f"\n  处理记录: {rid} | {video_title}")
@@ -660,7 +677,7 @@ def process_video_lifecycle():
                 print(f"  [2/4] ✅ 视频生成完成")
             except Exception as e:
                 print(f"  [2/4] ❌ 生成失败: {e}")
-                update_record_status(rid, STATUS_FAILED, {"错误信息": f"视频生成失败: {e}"})
+                update_record_status(rid, STATUS_FAILED_MAKE, {"错误信息": f"视频生成失败: {e}"})
                 continue
             
             # ③ 制作中 → 待下载（生成完成，等下载；但本地生成无需下载）
@@ -692,7 +709,7 @@ def process_video_lifecycle():
             
             if not video_path or not os.path.exists(video_path):
                 print(f"  ⚠️ 视频文件不存在: {video_path}")
-                update_record_status(rid, STATUS_FAILED, {"错误信息": f"视频文件不存在: {video_path}"})
+                update_record_status(rid, STATUS_FAILED_MAKE, {"错误信息": f"视频文件不存在: {video_path}"})
                 continue
             
             # ⑤ 待发布 → 发布中
@@ -720,7 +737,7 @@ def process_video_lifecycle():
                 print(f"  [6/7] ✅ 视频号发布成功: {video_url}")
             except Exception as e:
                 print(f"  [6/7] ❌ 发布异常: {e}")
-                update_record_status(rid, STATUS_FAILED, {"错误信息": str(e)})
+                update_record_status(rid, STATUS_FAILED_PUBLISH, {"错误信息": str(e)})
                 continue
             
             # ⑦ 发布中 → 已发布
@@ -746,7 +763,7 @@ def process_video_lifecycle():
                     
             except Exception as e:
                 print(f"  [7/7] ❌ 后处理失败: {e}")
-                update_record_status(rid, STATUS_FAILED, {"错误信息": str(e)})
+                update_record_status(rid, STATUS_FAILED_UPLOAD, {"错误信息": str(e)})
 
 
 def process_cleanup():
