@@ -881,4 +881,42 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="视频自动发布 Cron")
+    parser.add_argument("--dry-run", action="store_true", help="干跑：只打印操作，不实际执行")
+    args = parser.parse_args()
+
+    if args.dry_run:
+        import inspect
+        # patch update_record_status 和 lark_cli，打印调用栈
+        _orig_update = update_record_status
+        _orig_lark = lark_cli
+        _dry_run_calls = []
+
+        def dry_update(rid, status, extra_fields=None):
+            extra = f", extra={extra_fields}" if extra_fields else ""
+            _dry_run_calls.append(f"  update_record_status('{rid}', '{status}'{extra})")
+
+        def dry_lark(args):
+            print(f"  lark-cli {' '.join(args[:4])} ...")
+            return {"ok": True, "data": {"data": [], "fields": [], "record_id_list": []}}
+
+        globals()["update_record_status"] = dry_update
+        globals()["lark_cli"] = dry_lark
+
+        print("=== DRY RUN ===")
+        print()
+
     main()
+
+    if args.dry_run:
+        update_record_status = _orig_update
+        lark_cli = _orig_lark
+        if _dry_run_calls:
+            print()
+            print("以下函数调用被拦截（dry-run 模式，不实际执行）：")
+            for c in _dry_run_calls:
+                print(c)
+        else:
+            print("(无任何状态更新调用)")
+        print("=== DRY RUN END ===")
